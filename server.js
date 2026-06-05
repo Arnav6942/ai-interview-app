@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import { GoogleGenAI } from '@google/genai';
+import OpenAI from 'openai';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -17,16 +17,24 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+// ── Validate API Key ───────────────────────────────────────────────────────────
+if (!process.env.GROQ_API_KEY) {
+    console.error('❌ GROQ_API_KEY is missing from environment variables!');
+    process.exit(1);
+}
+console.log('✅ Groq API key loaded');
 
-// Per-session chat histories stored by sessionId
+const openai = new OpenAI({
+    apiKey: process.env.GROQ_API_KEY,
+    baseURL: 'https://api.groq.com/openai/v1',
+});
+
+// Per-session data: { systemPrompt, messages[] }
 const sessions = {};
 
-// ── Start Interview ────────────────────────────────────────────────────────────
-app.post('/api/start-interview', async (req, res) => {
-    const { topic, difficulty, sessionId } = req.body;
-
-    const systemInstruction = `You are a world-class, sharp, and demanding interviewer conducting a mock ${difficulty || 'intermediate'}-level interview for: ${topic}.
+// ── System Prompt Builder ──────────────────────────────────────────────────────
+function buildSystemPrompt(topic, difficulty) {
+    return `You are a world-class, sharp, and demanding interviewer conducting a mock ${difficulty || 'intermediate'}-level interview for: ${topic}.
 
 RULES:
 - Ask EXACTLY ONE focused question to begin. Do NOT ask multiple questions at once.
@@ -37,27 +45,41 @@ RULES:
 - Be direct, professional, and use industry-standard terminology.
 - Do NOT offer hints unless specifically asked.
 - Format your evaluations clearly starting with "Evaluation:" on a new line.`;
+}
 
-    sessions[sessionId] = [{ role: 'user', parts: [{ text: systemInstruction }] }];
+// ── Start Interview ────────────────────────────────────────────────────────────
+app.post('/api/start-interview', async (req, res) => {
+    const { topic, difficulty, sessionId } = req.body;
+
+    if (!topic || !sessionId) {
+        return res.status(400).json({ error: 'Missing topic or sessionId.' });
+    }
+
+    // Store system prompt + empty message history
+    sessions[sessionId] = {
+        systemPrompt: buildSystemPrompt(topic, difficulty),
+        messages: [],
+    };
 
     try {
-        const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: sessions[sessionId],
-            generationConfig: {
-                temperature: 0.8,
-                topP: 0.95,
-                maxOutputTokens: 512,
-            }
+        const response = await openai.chat.completions.create({
+            model: 'llama-3.3-70b-versatile',
+            messages: [
+                { role: 'system', content: sessions[sessionId].systemPrompt },
+            ],
+            max_tokens: 512,
+            temperature: 0.8,
         });
 
-        const reply = response.text;
-        sessions[sessionId].push({ role: 'model', parts: [{ text: reply }] });
+        const reply = response.choices[0].message.content;
+
+        // Store the opening question in history
+        sessions[sessionId].messages.push({ role: 'assistant', content: reply });
 
         res.json({ reply });
     } catch (error) {
-        console.error("Error starting interview:", error);
-        res.status(500).json({ error: "Failed to start interview." });
+        console.error('Error starting interview:', error.message);
+        res.status(500).json({ error: 'Failed to start interview. Check your OpenAI API key and quota.' });
     }
 });
 
@@ -66,57 +88,68 @@ app.post('/api/chat', async (req, res) => {
     const { message, sessionId } = req.body;
 
     if (!sessions[sessionId]) {
-        return res.status(400).json({ error: "Session not found. Please start the interview again." });
+        return res.status(400).json({ error: 'Session not found. Please start the interview again.' });
     }
 
-    sessions[sessionId].push({ role: 'user', parts: [{ text: message }] });
+    // Add user message to history
+    sessions[sessionId].messages.push({ role: 'user', content: message });
 
-    // Use SSE for streaming
+    // Build full messages array: system + all history
+    const messagesForAPI = [
+        { role: 'system', content: sessions[sessionId].systemPrompt },
+        ...sessions[sessionId].messages,
+    ];
+
+    // SSE headers
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
+    // Keepalive ping every 15s so Render doesn't drop the connection
+    const keepAlive = setInterval(() => res.write(': ping\n\n'), 15000);
+
+    let fullReply = '';
+
     try {
-        const streamResult = await ai.models.generateContentStream({
-            model: 'gemini-2.5-flash',
-            contents: sessions[sessionId],
-            generationConfig: {
-                temperature: 0.8,
-                topP: 0.95,
-                maxOutputTokens: 512,
-            }
+        const stream = await openai.chat.completions.create({
+            model: 'llama-3.3-70b-versatile',
+            messages: messagesForAPI,
+            max_tokens: 512,
+            temperature: 0.8,
+            stream: true,
         });
 
-        let fullReply = '';
-
-        for await (const chunk of streamResult) {
-            const chunkText = chunk.text;
-            if (chunkText) {
-                fullReply += chunkText;
-                res.write(`data: ${JSON.stringify({ chunk: chunkText })}\n\n`);
+        for await (const chunk of stream) {
+            const text = chunk.choices[0]?.delta?.content || '';
+            if (text) {
+                fullReply += text;
+                res.write(`data: ${JSON.stringify({ chunk: text })}\n\n`);
             }
         }
 
-        sessions[sessionId].push({ role: 'model', parts: [{ text: fullReply }] });
+        // Save assistant reply to session history
+        sessions[sessionId].messages.push({ role: 'assistant', content: fullReply });
 
         res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-        res.end();
     } catch (error) {
-        console.error("Error generating response:", error);
-        res.write(`data: ${JSON.stringify({ error: "Failed to generate response." })}\n\n`);
+        console.error('Error generating response:', error.message);
+        res.write(`data: ${JSON.stringify({ error: 'Failed to generate response.' })}\n\n`);
+    } finally {
+        clearInterval(keepAlive);
         res.end();
     }
 });
 
-// ── End session ────────────────────────────────────────────────────────────────
+// ── End Interview + Summary ────────────────────────────────────────────────────
 app.post('/api/end-interview', async (req, res) => {
     const { sessionId } = req.body;
 
-    if (!sessions[sessionId] || sessions[sessionId].length < 3) {
-        return res.json({ summary: "Interview was too short to generate a summary." });
+    if (!sessions[sessionId] || sessions[sessionId].messages.length < 2) {
+        return res.json({ summary: 'Interview was too short to generate a meaningful summary.' });
     }
 
-    const summaryPrompt = `Based on our interview conversation, provide a structured performance report with:
+    const summaryPrompt = `Based on our interview conversation so far, provide a structured performance report:
+
 1. **Overall Score**: X/10 with a one-line verdict
 2. **Strengths**: 2–3 bullet points on what the candidate did well
 3. **Areas to Improve**: 2–3 bullet points on weaknesses or gaps
@@ -125,26 +158,37 @@ app.post('/api/end-interview', async (req, res) => {
 
 Be honest, specific, and constructive. This is for a serious job-seeker.`;
 
-    const summaryHistory = [
-        ...sessions[sessionId],
-        { role: 'user', parts: [{ text: summaryPrompt }] }
+    const messagesForSummary = [
+        { role: 'system', content: sessions[sessionId].systemPrompt },
+        ...sessions[sessionId].messages,
+        { role: 'user', content: summaryPrompt },
     ];
 
     try {
-        const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: summaryHistory,
-            generationConfig: { temperature: 0.5, maxOutputTokens: 700 }
+        const response = await openai.chat.completions.create({
+            model: 'llama-3.3-70b-versatile',
+            messages: messagesForSummary,
+            max_tokens: 700,
+            temperature: 0.5,
         });
 
+        const summary = response.choices[0].message.content;
+
+        // Clean up session
         delete sessions[sessionId];
-        res.json({ summary: response.text });
+
+        res.json({ summary });
     } catch (error) {
-        console.error("Error generating summary:", error);
-        res.status(500).json({ error: "Failed to generate summary." });
+        console.error('Error generating summary:', error.message);
+        res.status(500).json({ error: 'Failed to generate summary.' });
     }
 });
 
+// ── Health Check ───────────────────────────────────────────────────────────────
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', sessions: Object.keys(sessions).length });
+});
+
 app.listen(port, () => {
-    console.log(`🚀 AI Interview App running at: http://localhost:${port}`);
+    console.log(`🚀 InterviewForge running at: http://localhost:${port}`);
 });
